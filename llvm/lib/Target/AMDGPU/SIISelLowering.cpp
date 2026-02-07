@@ -15844,9 +15844,9 @@ SITargetLowering::performExtractVectorEltCombine(SDNode *N,
       VecSize > 32 && VecSize % 32 == 0 && Idx) {
     EVT NewVT = getEquivalentMemType(*DAG.getContext(), VecVT);
 
-    unsigned BitIndex = Idx->getZExtValue() * VecEltSize;
-    unsigned EltIdx = BitIndex / 32;
-    unsigned LeftoverBitIdx = BitIndex % 32;
+    unsigned EltIdx = Idx->getZExtValue() * VecEltSize / 32;
+    unsigned SubVecLen = 32 / VecEltSize;
+    unsigned SubIdx = Idx->getZExtValue() % SubVecLen;
     SDLoc SL(N);
 
     SDValue Cast = DAG.getNode(ISD::BITCAST, SL, NewVT, Vec);
@@ -15855,20 +15855,13 @@ SITargetLowering::performExtractVectorEltCombine(SDNode *N,
     SDValue Elt = DAG.getNode(ISD::EXTRACT_VECTOR_ELT, SL, MVT::i32, Cast,
                               DAG.getConstant(EltIdx, SL, MVT::i32));
     DCI.AddToWorklist(Elt.getNode());
-    SDValue Srl = DAG.getNode(ISD::SRL, SL, MVT::i32, Elt,
-                              DAG.getConstant(LeftoverBitIdx, SL, MVT::i32));
-    DCI.AddToWorklist(Srl.getNode());
 
-    EVT VecEltAsIntVT = VecEltVT.changeTypeToInteger();
-    SDValue Trunc = DAG.getNode(ISD::TRUNCATE, SL, VecEltAsIntVT, Srl);
-    DCI.AddToWorklist(Trunc.getNode());
+    EVT SubVecVT = EVT::getVectorVT(*DAG.getContext(), VecEltVT, SubVecLen);
+    SDValue SubVec = DAG.getNode(ISD::BITCAST, SL, SubVecVT, Elt);
+    DCI.AddToWorklist(SubVec.getNode());
 
-    if (VecEltVT == ResVT) {
-      return DAG.getNode(ISD::BITCAST, SL, VecEltVT, Trunc);
-    }
-
-    assert(ResVT.isScalarInteger());
-    return DAG.getAnyExtOrTrunc(Trunc, SL, ResVT);
+    return DAG.getNode(ISD::EXTRACT_VECTOR_ELT, SL, ResVT, SubVec,
+                       DAG.getConstant(SubIdx, SL, MVT::i32));
   }
 
   return SDValue();

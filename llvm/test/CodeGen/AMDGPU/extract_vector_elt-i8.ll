@@ -581,18 +581,18 @@ define amdgpu_kernel void @reduce_load_vector_v8i8_extract_0123() #0 {
 ; SI-NEXT:    s_load_dword s0, s[0:1], 0x0
 ; SI-NEXT:    s_waitcnt lgkmcnt(0)
 ; SI-NEXT:    s_lshr_b32 s1, s0, 8
-; SI-NEXT:    s_lshr_b32 s2, s0, 16
-; SI-NEXT:    s_lshr_b32 s3, s0, 24
+; SI-NEXT:    s_lshr_b32 s2, s0, 24
+; SI-NEXT:    s_lshr_b32 s3, s0, 16
 ; SI-NEXT:    v_mov_b32_e32 v0, s0
 ; SI-NEXT:    flat_store_byte v[0:1], v0
 ; SI-NEXT:    s_waitcnt vmcnt(0)
 ; SI-NEXT:    v_mov_b32_e32 v0, s1
 ; SI-NEXT:    flat_store_byte v[0:1], v0
 ; SI-NEXT:    s_waitcnt vmcnt(0)
-; SI-NEXT:    v_mov_b32_e32 v0, s2
+; SI-NEXT:    v_mov_b32_e32 v0, s3
 ; SI-NEXT:    flat_store_byte v[0:1], v0
 ; SI-NEXT:    s_waitcnt vmcnt(0)
-; SI-NEXT:    v_mov_b32_e32 v0, s3
+; SI-NEXT:    v_mov_b32_e32 v0, s2
 ; SI-NEXT:    flat_store_byte v[0:1], v0
 ; SI-NEXT:    s_waitcnt vmcnt(0)
 ; SI-NEXT:    s_endpgm
@@ -607,17 +607,17 @@ define amdgpu_kernel void @reduce_load_vector_v8i8_extract_0123() #0 {
 ; VI-NEXT:    s_waitcnt lgkmcnt(0)
 ; VI-NEXT:    s_lshr_b32 s1, s0, 8
 ; VI-NEXT:    v_mov_b32_e32 v0, s0
-; VI-NEXT:    s_lshr_b32 s2, s0, 16
+; VI-NEXT:    s_lshr_b32 s3, s0, 16
 ; VI-NEXT:    flat_store_byte v[0:1], v0
 ; VI-NEXT:    s_waitcnt vmcnt(0)
 ; VI-NEXT:    v_mov_b32_e32 v0, s1
-; VI-NEXT:    s_lshr_b32 s3, s0, 24
-; VI-NEXT:    flat_store_byte v[0:1], v0
-; VI-NEXT:    s_waitcnt vmcnt(0)
-; VI-NEXT:    v_mov_b32_e32 v0, s2
+; VI-NEXT:    s_lshr_b32 s2, s0, 24
 ; VI-NEXT:    flat_store_byte v[0:1], v0
 ; VI-NEXT:    s_waitcnt vmcnt(0)
 ; VI-NEXT:    v_mov_b32_e32 v0, s3
+; VI-NEXT:    flat_store_byte v[0:1], v0
+; VI-NEXT:    s_waitcnt vmcnt(0)
+; VI-NEXT:    v_mov_b32_e32 v0, s2
 ; VI-NEXT:    flat_store_byte v[0:1], v0
 ; VI-NEXT:    s_waitcnt vmcnt(0)
 ; VI-NEXT:    s_endpgm
