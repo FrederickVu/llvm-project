@@ -15685,6 +15685,12 @@ SDValue SITargetLowering::performCvtPkRTZCombine(SDNode *N,
 // each input dword. This is achievable in two stages of four independent
 // v_perms each.
 //
+// The output dwords may live in different vNi8 SDValues in practice, and
+// multiple instances of this pattern can touch the same SDValue. To simplify
+// the process of tracking byte provenance, we match this pattern by processing
+// all dwords of any participating SDValue and assembling a list of permutation
+// data before creating one pseudo node per packet of data.
+//
 // To match for a single instance of the pattern, we trace byte provenance up
 // a chain of vector_shuffles or an extract_vector_elt into a build_vector to
 // collect source-side dwords, and then we track bytes of those dwords down the
@@ -16063,6 +16069,48 @@ static bool isCandidateDstVec(SDValue Seed) {
   return true;
 }
 
+// Emit BYTEPERM_4X4 pseudos for the matched instances and collect their
+// outputs.
+static void
+emitBYTEPERM_4X4Pseudos(SelectionDAG &DAG, SDLoc DL,
+                        ArrayRef<std::array<DwordKey, 4>> SrcDwordsData,
+                        ArrayRef<uint64_t> PermMaskData,
+                        SmallVectorImpl<SDValue> &NodeOuts,
+                        AMDGPUTargetLowering::DAGCombinerInfo &DCI) {
+  SDVTList VTs = DAG.getVTList(MVT::i32, MVT::i32, MVT::i32, MVT::i32);
+  NodeOuts.assign(PermMaskData.size() * 4, SDValue());
+
+  for (unsigned I = 0; I < PermMaskData.size(); ++I) {
+    SDValue In[4];
+    for (unsigned R = 0; R < 4; ++R) {
+      SDValue SrcVec(SrcDwordsData[I][R].getPointer(), 0);
+      unsigned SrcDwordIdx = SrcDwordsData[I][R].getInt();
+      In[R] = getDWordFromOffset(DAG, DL, SrcVec, SrcDwordIdx);
+    }
+
+    SDValue Mask = DAG.getConstant(PermMaskData[I], DL, MVT::i64);
+    SDValue PNode = DAG.getNode(AMDGPUISD::BYTEPERM_4X4, DL, VTs, In[0], In[1],
+                                In[2], In[3], Mask);
+    DCI.AddToWorklist(PNode.getNode());
+
+    for (unsigned O = 0; O < 4; ++O)
+      NodeOuts[I * 4 + O] = SDValue(PNode.getNode(), O);
+  }
+}
+
+// Build specified vNi8 output from i32 values in given order.
+static SDValue rebuildVecFromDwords(SelectionDAG &DAG, SDLoc DL, EVT DstVT,
+                                    ArrayRef<SDValue> DwordsI32) {
+  unsigned NumDwords = DwordsI32.size();
+  if (NumDwords == 1)
+    return DAG.getNode(ISD::BITCAST, DL, DstVT, DwordsI32[0]);
+
+  EVT DwordVecVT = EVT::getVectorVT(*DAG.getContext(), MVT::i32, NumDwords);
+  SDValue DwordVec = DAG.getBuildVector(DwordVecVT, DL, DwordsI32);
+  return DAG.getNode(ISD::BITCAST, DL, DstVT, DwordVec);
+}
+
+// Attempt to build a network of BYTEPERM_4X4 nodes.
 static SDValue matchBYTEPERM_4X4(SDNode *N,
                                  AMDGPUTargetLowering::DAGCombinerInfo &DCI) {
   if (!DCI.isBeforeLegalize())
@@ -16072,54 +16120,131 @@ static SDValue matchBYTEPERM_4X4(SDNode *N,
   if (!isCandidateDstVec(Seed))
     return SDValue();
 
-  EVT SeedVT = Seed.getValueType();
-  if (SeedVT != MVT::v16i8)
-    return SDValue();
+  // Worklist of destination dwords. Each dword either:
+  // - matches one BYTEPERM_4X4 instance (4 input dwords -> 4 output dwords), or
+  // - fails the match and aborts the whole combine.
+  SmallVector<DwordKey, 16> DstWL;
+  DenseSet<DwordKey> SeenDst;
 
-  std::array<DwordKey, 4> SrcDwords;
-  std::array<DwordKey, 4> DstDwords;
-  uint64_t PermMask = 0;
-  if (!matchDwordBYTEPERM_4X4(DwordKey(Seed.getNode(), 0), SrcDwords, DstDwords,
-                              PermMask))
-    return SDValue();
-
-  SDNode *SrcNode = SrcDwords[0].getPointer();
-  for (unsigned I = 0; I < 4; ++I) {
-    if (SrcDwords[I].getPointer() != SrcNode)
-      return SDValue();
-    if (SrcDwords[I].getInt() != I)
-      return SDValue();
+  EVT VT = Seed.getValueType();
+  unsigned SeedNumDwords = VT.getVectorNumElements() / 4;
+  for (unsigned D = 0; D < SeedNumDwords; ++D) {
+    DwordKey K(Seed.getNode(), D);
+    DstWL.push_back(K);
+    SeenDst.insert(K);
   }
-  for (unsigned Out = 0; Out < 4; ++Out) {
-    DwordKey DstDword = DstDwords[Out];
-    if (DstDword.getPointer() != Seed.getNode())
+
+  // Record four source dwords and 64-bit permutation mask for each pseudo node.
+  // Map destination dword to pseudo node index and result index of pseudo.
+  SmallVector<std::array<DwordKey, 4>, 8> SrcDwordsData;
+  SmallVector<uint64_t, 8> PermMaskData;
+  DenseMap<DwordKey, std::pair<unsigned, unsigned>> DstDwordToNodeRes;
+
+  while (!DstWL.empty()) {
+    DwordKey DstDwordSeed = DstWL.pop_back_val();
+    if (DstDwordToNodeRes.contains(DstDwordSeed))
+      continue;
+
+    std::array<DwordKey, 4> SrcDwords;
+    std::array<DwordKey, 4> DstDwords;
+    uint64_t PermMask = 0;
+    if (!matchDwordBYTEPERM_4X4(DstDwordSeed, SrcDwords, DstDwords, PermMask))
       return SDValue();
-    if (DstDword.getInt() != Out)
+
+    // Check if dword is already part of an instance.
+    int ExistingInst = -1;
+    for (unsigned I = 0; I < 4; ++I) {
+      auto It = DstDwordToNodeRes.find(DstDwords[I]);
+      if (It == DstDwordToNodeRes.end())
+        continue;
+      if (ExistingInst < 0)
+        ExistingInst = int(It->second.first);
+      else if (ExistingInst != int(It->second.first))
+        return SDValue();
+    }
+
+    // Verify that dwords agree on the same instance.
+    if (ExistingInst >= 0) {
+      unsigned InstIdx = unsigned(ExistingInst);
+      if (SrcDwordsData[InstIdx] != SrcDwords ||
+          PermMaskData[InstIdx] != PermMask)
+        return SDValue();
+    } else {
+      unsigned InstIdx = PermMaskData.size();
+      SrcDwordsData.push_back(SrcDwords);
+      PermMaskData.push_back(PermMask);
+      for (unsigned I = 0; I < 4; ++I)
+        DstDwordToNodeRes.try_emplace(DstDwords[I], std::make_pair(InstIdx, I));
+    }
+
+    for (unsigned I = 0; I < 4; ++I)
+      if (SeenDst.insert(DstDwords[I]).second)
+        DstWL.push_back(DstDwords[I]);
+  }
+
+  if (PermMaskData.empty())
+    return SDValue();
+
+  // Check each dword is part of an instance if any are. Can relax this in
+  // future.
+  SmallPtrSet<SDNode *, 16> DstNodes;
+  for (auto &KV : DstDwordToNodeRes)
+    DstNodes.insert(KV.first.getPointer());
+
+  SmallVector<SDValue, 16> DstVecs;
+  for (SDNode *Node : DstNodes) {
+    SDValue DstVec(Node, 0);
+    EVT DstVT = DstVec.getValueType();
+    unsigned NumDwords = DstVT.getVectorNumElements() / 4;
+    if (NumDwords == 0 || NumDwords > 4)
       return SDValue();
+    for (unsigned D = 0; D < NumDwords; ++D) {
+      DwordKey DstK(Node, D);
+      if (!DstDwordToNodeRes.contains(DstK))
+        return SDValue();
+    }
+    DstVecs.push_back(DstVec);
   }
 
   SelectionDAG &DAG = DCI.DAG;
   SDLoc DL(Seed);
-  SDValue In[4];
-  for (unsigned I = 0; I < 4; ++I) {
-    SDValue SrcVec(SrcDwords[I].getPointer(), 0);
-    In[I] = getDWordFromOffset(DAG, DL, SrcVec, SrcDwords[I].getInt());
+  SmallVector<SDValue, 8> NodeOuts;
+  emitBYTEPERM_4X4Pseudos(DAG, DL, SrcDwordsData, PermMaskData, NodeOuts, DCI);
+
+  // Rebuild all destination vectors and replace uses.
+  SDValue SeedReplacement;
+
+  for (SDValue DstVec : DstVecs) {
+    EVT DstVT = DstVec.getValueType();
+    unsigned NumDwords = DstVT.getVectorNumElements() / 4;
+
+    SmallVector<SDValue, 4> DwordsI32;
+    DwordsI32.reserve(NumDwords);
+
+    for (unsigned D = 0; D < NumDwords; ++D) {
+      DwordKey DstK(DstVec.getNode(), D);
+      auto It = DstDwordToNodeRes.find(DstK);
+      if (It == DstDwordToNodeRes.end())
+        return SDValue();
+
+      unsigned InstIdx = It->second.first;
+      unsigned Out = It->second.second;
+      DwordsI32.push_back(NodeOuts[InstIdx * 4 + Out]);
+    }
+
+    SDValue NewVec = rebuildVecFromDwords(DAG, DL, DstVT, DwordsI32);
+    if (!NewVec.getNode())
+      return SDValue();
+
+    DCI.AddToWorklist(NewVec.getNode());
+
+    if (DstVec == Seed)
+      SeedReplacement = NewVec;
+    else
+      DAG.ReplaceAllUsesOfValueWith(DstVec, NewVec);
   }
 
-  SDVTList VTs = DAG.getVTList(MVT::i32, MVT::i32, MVT::i32, MVT::i32);
-  SDValue Mask = DAG.getConstant(PermMask, DL, MVT::i64);
-  SDValue Pseudo = DAG.getNode(AMDGPUISD::BYTEPERM_4X4, DL, VTs, In[0], In[1],
-                               In[2], In[3], Mask);
-  DCI.AddToWorklist(Pseudo.getNode());
-
-  std::array<SDValue, 4> DwordsI32;
-  for (unsigned D = 0; D < 4; ++D)
-    DwordsI32[D] = SDValue(Pseudo.getNode(), D);
-
-  SDValue DwordVec = DAG.getBuildVector(MVT::v4i32, DL, DwordsI32);
-  SDValue NewVec = DAG.getNode(ISD::BITCAST, DL, SeedVT, DwordVec);
-  DCI.AddToWorklist(NewVec.getNode());
-  return NewVec;
+  return SeedReplacement;
 }
 
 static bool expandBYTEPERM_4X4(SDNode *N,
@@ -16141,6 +16266,23 @@ static bool expandBYTEPERM_4X4(SDNode *N,
   // comprised of nodes which collect the elements of P_i which are requested by
   // Q_j. Labelling these nodes as I_{ij}, the nodes of stage 2 then take I_{0j}
   // and I_{1j} as operands to produce the desired outputs.
+  //
+  // There is potential for further optimization using v_swap_b16 instructions,
+  // which swap high and/or low register halves between two registers. Each
+  // v_swap can replace two v_perms when applicable. It is always possible to
+  // make use of at least one v_swap by the pigeonhole principle:
+  //
+  // There are three possible partitions of the 4 output dwords into sets of 2.
+  // For each input dword, there is one output dword partition for which the two
+  // dwords in each set select from the high or low halves of the input dword.
+  // Since we have four input dwords, there exists a pair of input dwords
+  // sharing the same output partition. A v_swap can then be used to swap the
+  // half of one input dword that is desired by one set of the output partition
+  // with the half of the other input dword which is desired by the other set of
+  // the partition.
+  //
+  // Since v_swap cannot change the order of bytes within a register half, stage
+  // 1 v_perms must be canonicalized not to do so as well.
 
   auto EmitPerm = [&](SDValue Src0, SDValue Src1, uint32_t MaskVal) {
     return DAG.getNode(AMDGPUISD::PERM, DL, MVT::i32, Src0, Src1,
@@ -16171,20 +16313,137 @@ static bool expandBYTEPERM_4X4(SDNode *N,
     }
   }
 
-  // Choose a simple partition of input and output dwords. TODO: Optimize for
-  // v_swap_b16.
-  static constexpr uint8_t P[2][2] = {{0, 1}, {2, 3}};
-  static constexpr uint8_t Q[2][2] = {{0, 1}, {2, 3}};
-  static constexpr uint8_t DstToQ[4] = {0, 0, 1, 1};
+  // Fix an order of the output dwords. For a given input dword, we associate
+  // a 4-bit string indicating whether an output dword requests a byte from the
+  // upper or lower half. There are (4 choose 2) = 6 possible bitstrings, and
+  // each is associated with an output partition by taking as sets the dwords
+  // which request from the same half. Bitstrings B and B ^ 0xF yield the same
+  // partition, and we canonicalize the correspondence by taking the minimum of
+  // B and B ^ 0xF, yielding possible values 0x3, 0x5, and 0x6.
+  //
+  // Thus, we calculate this value for each input dword and take the first two
+  // dwords that share the same value to form the input partition.
+
+  uint8_t HighMask[4] = {0, 0, 0, 0};
+  for (unsigned SrcDword = 0; SrcDword < 4; ++SrcDword) {
+    uint8_t M = 0;
+    for (unsigned DstDword = 0; DstDword < 4; ++DstDword)
+      if (ByteSel[DstDword][SrcDword] & 0x2)
+        M |= (1u << DstDword);
+    HighMask[SrcDword] = M;
+  }
+
+  auto PartitionKey = [](uint8_t M) {
+    uint8_t C = uint8_t(M ^ 0xF);
+    return (M < C) ? M : C;
+  };
+
+  uint8_t PartKey[4] = {PartitionKey(HighMask[0]), PartitionKey(HighMask[1]),
+                        PartitionKey(HighMask[2]), PartitionKey(HighMask[3])};
+
+  // Choose P0 as the first pair of inputs sharing a partition key.
+  uint8_t A0 = 0, B0 = 0;
+  bool Found = false;
+  for (uint8_t X = 0; X < 4 && !Found; ++X) {
+    for (uint8_t Y = X + 1; Y < 4; ++Y) {
+      if (PartKey[X] == PartKey[Y]) {
+        A0 = X;
+        B0 = Y;
+        Found = true;
+        break;
+      }
+    }
+  }
+
+  // Canonicalize order of P0.
+  uint8_t P[2][2];
+  if (B0 < A0)
+    std::swap(A0, B0);
+  P[0][0] = A0;
+  P[0][1] = B0;
+
+  // Build P1 and canoncalize order.
+  unsigned R = 0;
+  for (uint8_t SrcDword = 0; SrcDword < 4; ++SrcDword)
+    if (SrcDword != A0 && SrcDword != B0)
+      P[1][R++] = SrcDword;
+  if (P[1][1] < P[1][0])
+    std::swap(P[1][0], P[1][1]);
+
+  // Arbitrary: define Q0 as the DstDwords requesting low half of P0[0].
+  uint8_t Q0Mask = HighMask[P[0][0]] ^ 0xF;
+  uint8_t QKey = PartKey[P[0][0]];
+
+  uint8_t Q[2][2];
+  uint8_t DstToQ[4] = {0};
+  unsigned N0 = 0, N1 = 0;
+  for (uint8_t DstDword = 0; DstDword < 4; ++DstDword) {
+    if (Q0Mask & (1u << DstDword)) {
+      Q[0][N0++] = DstDword;
+      DstToQ[DstDword] = 0;
+    } else {
+      Q[1][N1++] = DstDword;
+      DstToQ[DstDword] = 1;
+    }
+  }
+
+  // Selector masks for possible v_swap optimizations (Src0=B, Src1=A).
+  static constexpr uint32_t SwapMask[4][2] = {
+      {0x05040100u, 0x07060302u}, // [A.lo|B.lo], [A.hi|B.hi]
+      {0x07060100u, 0x03020504u}, // [A.lo|B.hi], [B.lo|A.hi]
+      {0x03020504u, 0x07060100u}, // [B.lo|A.hi], [A.lo|B.hi]
+      {0x03020706u, 0x01000504u}, // [B.hi|A.hi], [B.lo|A.lo]
+  };
 
   // Stage 1 intermediates.
   SDValue I[2][2];
-  uint8_t Stage1Src[2][2][4];
+
+  // SelOfSrc[Qj][FlatSrcByte] = selector value for requested byte from
+  // (I_{1j}, I_{0j}).
+  uint8_t SelOfSrc[2][16];
+  for (auto &Row : SelOfSrc)
+    for (uint8_t &V : Row)
+      V = 0xFF;
+
+  // When we form the v_perms for stage 1, we track where the source bytes land
+  // in the intermediate nodes for use in stage 2 v_perm mask construction.
+  auto UpdateSelMap = [&](unsigned Pi, unsigned Qj, uint8_t A, uint8_t B,
+                          uint32_t M) {
+    for (unsigned Pos = 0; Pos < 4; ++Pos) {
+      uint8_t Sel = (M >> (8 * Pos)) & 0xFF;
+      uint8_t FlatSrcByte =
+          (Sel < 4) ? uint8_t(A * 4 + Sel) : uint8_t(B * 4 + (Sel - 4));
+      SelOfSrc[Qj][FlatSrcByte] = uint8_t((Pi ? 4 : 0) + Pos);
+    }
+  };
 
   // Emit stage 1.
   for (unsigned Pi = 0; Pi < 2; ++Pi) {
     uint8_t A = P[Pi][0];
     uint8_t B = P[Pi][1];
+
+    bool ACompat = (PartKey[A] == QKey);
+    bool BCompat = (PartKey[B] == QKey);
+
+    // Pack for later v_swap optimization.
+    if (ACompat && BCompat) {
+      // Determine if Q0 requests high halves from sources A and B.
+      unsigned Q0HighA = (HighMask[A] == Q0Mask) ? 1u : 0u;
+      unsigned Q0HighB = (HighMask[B] == Q0Mask) ? 1u : 0u;
+      unsigned Idx = (Q0HighA << 1) | Q0HighB;
+
+      uint32_t M0 = SwapMask[Idx][0];
+      uint32_t M1 = SwapMask[Idx][1];
+
+      I[Pi][0] = EmitPerm(SrcDwordVal[B], SrcDwordVal[A], M0);
+      UpdateSelMap(Pi, 0, A, B, M0);
+
+      I[Pi][1] = EmitPerm(SrcDwordVal[B], SrcDwordVal[A], M1);
+      UpdateSelMap(Pi, 1, A, B, M1);
+      continue;
+    }
+
+    // Generic packing.
     for (unsigned Qj = 0; Qj < 2; ++Qj) {
       uint8_t D0 = Q[Qj][0];
       uint8_t D1 = Q[Qj][1];
@@ -16200,15 +16459,12 @@ static bool expandBYTEPERM_4X4(SDNode *N,
         std::swap(B0b, B1b);
 
       uint32_t M = PackMask(A0b, A1b, uint8_t(4 + B0b), uint8_t(4 + B1b));
-      Stage1Src[Pi][Qj][0] = uint8_t(A * 4 + A0b);
-      Stage1Src[Pi][Qj][1] = uint8_t(A * 4 + A1b);
-      Stage1Src[Pi][Qj][2] = uint8_t(B * 4 + B0b);
-      Stage1Src[Pi][Qj][3] = uint8_t(B * 4 + B1b);
       I[Pi][Qj] = EmitPerm(SrcDwordVal[B], SrcDwordVal[A], M);
+      UpdateSelMap(Pi, Qj, A, B, M);
     }
   }
 
-  // Emit stage 2.
+  // Stage 2: build outputs from I_{0j}, I_{1j}.
   Results.assign(4, SDValue());
   for (unsigned DstDword = 0; DstDword < 4; ++DstDword) {
     unsigned Qj = DstToQ[DstDword];
@@ -16217,17 +16473,11 @@ static bool expandBYTEPERM_4X4(SDNode *N,
     for (unsigned DstByte = 0; DstByte < 4; ++DstByte) {
       unsigned FlatDstByte = DstDword * 4 + DstByte;
       uint8_t Want = SrcId[FlatDstByte];
-      int Sel = -1;
-      for (unsigned Pi = 0; Pi < 2 && Sel < 0; ++Pi) {
-        for (unsigned Pos = 0; Pos < 4; ++Pos) {
-          if (Stage1Src[Pi][Qj][Pos] == Want) {
-            Sel = (Pi ? 4 : 0) + Pos;
-            break;
-          }
-        }
-      }
-      if (Sel < 0)
+
+      uint8_t Sel = SelOfSrc[Qj][Want];
+      if (Sel == 0xFF)
         return false;
+
       M |= uint32_t(Sel) << (8 * DstByte);
     }
 
