@@ -24311,6 +24311,28 @@ SDValue DAGCombiner::visitINSERT_VECTOR_ELT(SDNode *N) {
         }
       }
 
+      // If the base is a vector of matching type and the chain filled all but
+      // one element, synthesize an EXTRACT_VECTOR_ELT for the remaining
+      // position and create a BUILD_VECTOR. This handles chains like:
+      //   insert_vector_elt(insert_vector_elt(...(base_vec, v1, 1)..., vN, N))
+      // where base_vec is e.g. an EXTRACT_SUBVECTOR or BITCAST from a load,
+      // and only position 0 is inherited from the base.
+      // Skip small vectors (<=2 elements) where the cost of synthesizing
+      // EXTRACT_VECTOR_ELT is not justified and can inhibit load coalescing.
+      if (CurVec.getValueType() == VT && NumElts > 2) {
+        unsigned NumFilled = count_if(Ops, [](SDValue Op) { return !!Op; });
+        if (NumFilled + 1 >= NumElts) {
+          for (unsigned I = 0; I != NumElts; ++I)
+            if (!Ops[I])
+              AddBuildVectorOp(Ops,
+                               DAG.getNode(ISD::EXTRACT_VECTOR_ELT, DL,
+                                           VT.getVectorElementType(), CurVec,
+                                           DAG.getVectorIdxConstant(I, DL)),
+                               I);
+          return CanonicalizeBuildVector(Ops);
+        }
+      }
+
       // Failed to find a match in the chain - bail.
       break;
     }

@@ -7102,12 +7102,11 @@ define <32 x i8> @load_v32i8_v32i8(<32 x i8> %trigger, ptr %addr, <32 x i8> %dst
 define <4 x float> @mload_constmask_v4f32(ptr %addr, <4 x float> %dst) {
 ; SSE2-LABEL: mload_constmask_v4f32:
 ; SSE2:       ## %bb.0:
+; SSE2-NEXT:    shufps {{.*#+}} xmm0 = xmm0[1,1,1,1]
 ; SSE2-NEXT:    movss {{.*#+}} xmm1 = mem[0],zero,zero,zero
-; SSE2-NEXT:    movss {{.*#+}} xmm2 = mem[0],zero,zero,zero
-; SSE2-NEXT:    movss {{.*#+}} xmm3 = mem[0],zero,zero,zero
-; SSE2-NEXT:    movlhps {{.*#+}} xmm3 = xmm3[0],xmm2[0]
-; SSE2-NEXT:    movss {{.*#+}} xmm0 = xmm1[0],xmm0[1,2,3]
-; SSE2-NEXT:    shufps {{.*#+}} xmm0 = xmm0[0,1],xmm3[2,0]
+; SSE2-NEXT:    unpcklps {{.*#+}} xmm1 = xmm1[0],xmm0[0],xmm1[1],xmm0[1]
+; SSE2-NEXT:    movhps {{.*#+}} xmm1 = xmm1[0,1],mem[0,1]
+; SSE2-NEXT:    movaps %xmm1, %xmm0
 ; SSE2-NEXT:    retq
 ;
 ; SSE42-LABEL: mload_constmask_v4f32:
@@ -7204,12 +7203,9 @@ define <4 x i32> @mload_constmask_v4i32(ptr %addr, <4 x i32> %dst) {
 ; SSE2-LABEL: mload_constmask_v4i32:
 ; SSE2:       ## %bb.0:
 ; SSE2-NEXT:    movss {{.*#+}} xmm1 = mem[0],zero,zero,zero
-; SSE2-NEXT:    movlhps {{.*#+}} xmm1 = xmm1[0],xmm0[0]
-; SSE2-NEXT:    movss {{.*#+}} xmm0 = mem[0],zero,zero,zero
-; SSE2-NEXT:    movss {{.*#+}} xmm2 = mem[0],zero,zero,zero
-; SSE2-NEXT:    movlhps {{.*#+}} xmm2 = xmm2[0],xmm0[0]
-; SSE2-NEXT:    shufps {{.*#+}} xmm1 = xmm1[2,0],xmm2[2,0]
-; SSE2-NEXT:    movaps %xmm1, %xmm0
+; SSE2-NEXT:    unpcklps {{.*#+}} xmm0 = xmm0[0],xmm1[0],xmm0[1],xmm1[1]
+; SSE2-NEXT:    movsd {{.*#+}} xmm1 = mem[0],zero
+; SSE2-NEXT:    movlhps {{.*#+}} xmm0 = xmm0[0],xmm1[0]
 ; SSE2-NEXT:    retq
 ;
 ; SSE42-LABEL: mload_constmask_v4i32:
@@ -7299,21 +7295,18 @@ define <2 x i64> @mload_constmask_v2i64(ptr %addr, <2 x i64> %dst) {
 define <8 x float> @mload_constmask_v8f32(ptr %addr, <8 x float> %dst) {
 ; SSE2-LABEL: mload_constmask_v8f32:
 ; SSE2:       ## %bb.0:
-; SSE2-NEXT:    movss {{.*#+}} xmm3 = mem[0],zero,zero,zero
+; SSE2-NEXT:    shufps {{.*#+}} xmm0 = xmm0[3,3,3,3]
 ; SSE2-NEXT:    movss {{.*#+}} xmm2 = mem[0],zero,zero,zero
-; SSE2-NEXT:    movlhps {{.*#+}} xmm2 = xmm2[0],xmm3[0]
-; SSE2-NEXT:    movss {{.*#+}} xmm3 = mem[0],zero,zero,zero
-; SSE2-NEXT:    shufps {{.*#+}} xmm3 = xmm3[0,0],xmm0[3,0]
-; SSE2-NEXT:    shufps {{.*#+}} xmm2 = xmm2[2,0],xmm3[0,2]
-; SSE2-NEXT:    movaps %xmm2, %xmm0
+; SSE2-NEXT:    unpcklps {{.*#+}} xmm2 = xmm2[0],xmm0[0],xmm2[1],xmm0[1]
+; SSE2-NEXT:    movsd {{.*#+}} xmm0 = mem[0],zero
+; SSE2-NEXT:    movlhps {{.*#+}} xmm0 = xmm0[0],xmm2[0]
 ; SSE2-NEXT:    retq
 ;
 ; SSE42-LABEL: mload_constmask_v8f32:
 ; SSE42:       ## %bb.0:
-; SSE42-NEXT:    movss {{.*#+}} xmm2 = mem[0],zero,zero,zero
-; SSE42-NEXT:    movsd {{.*#+}} xmm0 = xmm2[0],xmm0[1]
-; SSE42-NEXT:    insertps {{.*#+}} xmm0 = xmm0[0],mem[0],xmm0[2,3]
-; SSE42-NEXT:    insertps {{.*#+}} xmm0 = xmm0[0,1],mem[0],xmm0[3]
+; SSE42-NEXT:    movsd {{.*#+}} xmm2 = mem[0],zero
+; SSE42-NEXT:    insertps {{.*#+}} xmm2 = xmm2[0,1],mem[0],xmm2[3]
+; SSE42-NEXT:    blendps {{.*#+}} xmm0 = xmm2[0,1,2],xmm0[3]
 ; SSE42-NEXT:    retq
 ;
 ; AVX1OR2-LABEL: mload_constmask_v8f32:
@@ -7415,8 +7408,8 @@ define <8 x float> @mload_constmask_v8f32_zero(ptr %addr, <8 x float> %dst) {
 define <4 x double> @mload_constmask_v4f64(ptr %addr, <4 x double> %dst) {
 ; SSE-LABEL: mload_constmask_v4f64:
 ; SSE:       ## %bb.0:
-; SSE-NEXT:    movups (%rdi), %xmm0
 ; SSE-NEXT:    movlps {{.*#+}} xmm1 = mem[0,1],xmm1[2,3]
+; SSE-NEXT:    movups (%rdi), %xmm0
 ; SSE-NEXT:    retq
 ;
 ; AVX1OR2-LABEL: mload_constmask_v4f64:
@@ -7465,23 +7458,22 @@ define <4 x double> @mload_constmask_v4f64(ptr %addr, <4 x double> %dst) {
 define <8 x i32> @mload_constmask_v8i32(ptr %addr, <8 x i32> %dst) {
 ; SSE2-LABEL: mload_constmask_v8i32:
 ; SSE2:       ## %bb.0:
-; SSE2-NEXT:    movss {{.*#+}} xmm3 = mem[0],zero,zero,zero
+; SSE2-NEXT:    pshufd {{.*#+}} xmm0 = xmm0[3,3,3,3]
+; SSE2-NEXT:    movd {{.*#+}} xmm2 = mem[0],zero,zero,zero
+; SSE2-NEXT:    punpckldq {{.*#+}} xmm2 = xmm2[0],xmm0[0],xmm2[1],xmm0[1]
+; SSE2-NEXT:    movq {{.*#+}} xmm0 = mem[0],zero
+; SSE2-NEXT:    punpcklqdq {{.*#+}} xmm0 = xmm0[0],xmm2[0]
 ; SSE2-NEXT:    movss {{.*#+}} xmm2 = mem[0],zero,zero,zero
-; SSE2-NEXT:    movlhps {{.*#+}} xmm2 = xmm2[0],xmm3[0]
-; SSE2-NEXT:    movss {{.*#+}} xmm3 = mem[0],zero,zero,zero
-; SSE2-NEXT:    shufps {{.*#+}} xmm3 = xmm3[0,0],xmm0[3,0]
-; SSE2-NEXT:    shufps {{.*#+}} xmm2 = xmm2[2,0],xmm3[0,2]
-; SSE2-NEXT:    movss {{.*#+}} xmm0 = mem[0],zero,zero,zero
-; SSE2-NEXT:    shufps {{.*#+}} xmm0 = xmm0[0,1],xmm1[2,3]
-; SSE2-NEXT:    shufps {{.*#+}} xmm1 = xmm1[0,1],xmm0[2,0]
-; SSE2-NEXT:    movaps %xmm2, %xmm0
+; SSE2-NEXT:    shufps {{.*#+}} xmm2 = xmm2[0,1],xmm1[2,3]
+; SSE2-NEXT:    shufps {{.*#+}} xmm1 = xmm1[0,1],xmm2[2,0]
 ; SSE2-NEXT:    retq
 ;
 ; SSE42-LABEL: mload_constmask_v8i32:
 ; SSE42:       ## %bb.0:
-; SSE42-NEXT:    pinsrd $0, (%rdi), %xmm0
-; SSE42-NEXT:    pinsrd $1, 4(%rdi), %xmm0
-; SSE42-NEXT:    pinsrd $2, 8(%rdi), %xmm0
+; SSE42-NEXT:    movd {{.*#+}} xmm2 = mem[0],zero,zero,zero
+; SSE42-NEXT:    pinsrd $1, 4(%rdi), %xmm2
+; SSE42-NEXT:    pinsrd $2, 8(%rdi), %xmm2
+; SSE42-NEXT:    pblendw {{.*#+}} xmm0 = xmm2[0,1,2,3,4,5],xmm0[6,7]
 ; SSE42-NEXT:    pinsrd $3, 28(%rdi), %xmm1
 ; SSE42-NEXT:    retq
 ;
